@@ -3,12 +3,13 @@
 
 use crate::Colour;
 use crate::WhiteSpace;
+use crate::render::text_renderer::RenderLine;
 
 pub(crate) mod text_renderer;
 
 pub use text_renderer::{
     PlainDecorator, RichAnnotation, RichDecorator, TaggedLine, TaggedLineElement, TextDecorator,
-    TrivialDecorator,
+    TrivialDecorator, Case, TaggedString,
 };
 
 pub(crate) type Result<T> = std::result::Result<T, TooNarrow>;
@@ -27,8 +28,16 @@ pub(crate) trait Renderer {
     /// Add an empty line to the output (ie between blocks).
     fn add_empty_line(&mut self) -> Result<()>;
 
+    /// Add an empty line to the output (ie between blocks) if necessary.
+    fn maybe_add_empty_line(&mut self) -> Result<()>;
+
     /// Create a sub-renderer for nested blocks.
     fn new_sub_renderer(&self, width: usize) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Create a sub-renderer for nested blocks.
+    fn new_cased_sub_renderer(&self, width: usize, case: Case) -> Result<Self>
     where
         Self: Sized;
 
@@ -77,7 +86,7 @@ pub(crate) trait Renderer {
 
     /// Add a new block from a sub renderer, and prefix every line by the
     /// corresponding text from each iteration of prefixes.
-    fn append_subrender<'a, I>(&mut self, other: Self, prefixes: I) -> Result<()>
+    fn append_subrender<'a, I>(&mut self, other: Self, prefixes: I, condition_fn: Option<fn(&Vec<String>) -> bool>) -> Result<()>
     where
         I: Iterator<Item = &'a str>;
 

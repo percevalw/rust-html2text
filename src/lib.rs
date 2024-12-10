@@ -67,7 +67,8 @@ pub mod render;
 use render::text_renderer::{
     RenderLine, RenderOptions, RichAnnotation, SubRenderer, TaggedLine, TextRenderer,
 };
-use render::{Renderer, RichDecorator, TextDecorator};
+use render::{Renderer, RichDecorator, TextDecorator, Case};
+use std::borrow::Cow;
 
 use html5ever::driver::ParseOpts;
 use html5ever::parse_document;
@@ -81,7 +82,7 @@ use markup5ever_rcdom::{
 };
 use std::cell::Cell;
 use std::cmp::{max, min};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use unicode_width::UnicodeWidthStr;
 
@@ -347,12 +348,9 @@ struct RenderTableCell {
 impl RenderTableCell {
     /// Calculate or return the estimate size of the cell
     fn get_size_estimate(&self) -> SizeEstimate {
-        let Some(size) = self.size_estimate.get() else {
-            let size = self
-                .content
-                .iter()
-                .map(|node| node.get_size_estimate())
-                .fold(Default::default(), SizeEstimate::add);
+        let Some(size) = self.size_estimate.get() else
+        {
+            let size = split_and_calculate_max_size(self.content.iter(), |n| n.get_size_estimate());
             self.size_estimate.set(Some(size));
             return size;
         };
@@ -510,16 +508,23 @@ impl RenderTable {
             let mut colno = 0usize;
             for cell in row.cells() {
                 let cellsize = cell.get_size_estimate();
+                // println!("Cellsize {:?} for cell {:?}", cellsize, cell);
                 for colnum in 0..cell.colspan {
-                    sizes[colno + colnum].size += cellsize.size / cell.colspan;
+                    // let border = if (colnum + colno > 0) { 1 } else { 0 };
+                    // println!("Cellsize {:?}, Colnum: {:?}, Border: {} for cell {:?}", cellsize, colnum, border, cell);
+                    sizes[colno + colnum].size = max(
+                        sizes[colno + colnum].size,
+                        cellsize.size / cell.colspan, //+ border,
+                    );
                     sizes[colno + colnum].min_width = max(
                         sizes[colno + colnum].min_width,
-                        cellsize.min_width / cell.colspan,
+                        cellsize.min_width / cell.colspan, //+ border,
                     );
                 }
                 colno += cell.colspan;
             }
         }
+        // println!("Sizes: {:?}", sizes);
         let size = sizes.iter().map(|s| s.size).sum(); // Include borders?
         let min_width = sizes.iter().map(|s| s.min_width).sum::<usize>() + self.num_columns - 1;
         let result = SizeEstimate {
@@ -532,6 +537,51 @@ impl RenderTable {
     }
 }
 
+fn split_and_calculate_max_size<'a, I>(
+    nodes: I,
+    recurse: impl Fn(&RenderNode) -> SizeEstimate,
+) -> SizeEstimate
+where
+    I: Iterator<Item=&'a RenderNode>,
+{
+    use RenderNodeInfo::*;
+    let mut max_size_estimate = SizeEstimate::default();
+    let mut current_chunk = Vec::new();
+
+    for node in nodes {
+        if let Break = node.info {
+            // Compute the size for the current chunk and update max_size_estimate
+            if !current_chunk.is_empty() {
+                let chunk_size = current_chunk
+                    .iter()
+                    .map(|n| recurse(*n))
+                    .fold(Default::default(), SizeEstimate::add);
+                max_size_estimate = max_size_estimate.max(chunk_size);
+                // println!("  -------------------");
+                // println!("  current_chunk: {:?}", current_chunk);
+                // println!("  max_size_estimate: {:?}", max_size_estimate);
+                current_chunk.clear();
+            }
+        } else {
+            current_chunk.push(node);
+        }
+    }
+
+    // Handle the last chunk if it exists
+    if !current_chunk.is_empty() {
+        let chunk_size = current_chunk
+            .iter()
+            .map(|n| recurse(*n))
+            .fold(Default::default(), SizeEstimate::add);
+        max_size_estimate = max_size_estimate.max(chunk_size);
+        // println!("  -------------------");
+        // println!("  current_chunk: {:?}", current_chunk);
+        // println!("  max_size_estimate: {:?}", max_size_estimate);
+    }
+
+    max_size_estimate
+}
+
 /// The node-specific information distilled from the DOM.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -540,6 +590,8 @@ enum RenderNodeInfo {
     Text(String),
     /// A group of nodes collected together.
     Container(Vec<RenderNode>),
+    /// A container that starts with a fragment marker
+    FragmentContainer(Vec<RenderNode>),
     /// A link with contained nodes
     Link(String, Vec<RenderNode>),
     /// An emphasised region
@@ -588,6 +640,9 @@ enum RenderNodeInfo {
     ListItem(Vec<RenderNode>),
     /// Superscript text
     Sup(Vec<RenderNode>),
+
+    /// Form, not rendered
+    Form,
 }
 
 /// Common fields from a node.
@@ -643,7 +698,7 @@ impl RenderNode {
                 use unicode_width::UnicodeWidthChar;
                 let mut len = 0;
                 let mut in_whitespace = false;
-                for c in t.trim().chars() {
+                for c in t.trim_start().chars() {
                     let is_ws = c.is_whitespace();
                     if !is_ws {
                         len += UnicodeWidthChar::width(c).unwrap_or(0);
@@ -658,9 +713,13 @@ impl RenderNode {
                 if let Some(true) = t.chars().next().map(|c| c.is_whitespace()) {
                     len += 1;
                 }
-                if let Img(_, _) = self.info {
-                    len += 2;
+                if in_whitespace {
+                    len += 1;
                 }
+                /*if let Img(_, _) = self.info {
+                    len += 2;
+                }*/
+                // println!("Text: {:?} -> {:?}", t, len);
                 SizeEstimate {
                     size: len,
                     min_width: len.min(context.min_wrap_width),
@@ -668,20 +727,26 @@ impl RenderNode {
                 }
             }
 
-            Container(ref v) | Em(ref v) | Strong(ref v) | Strikeout(ref v) | Code(ref v)
-            | Block(ref v) | Div(ref v) | Dl(ref v) | Dt(ref v) | ListItem(ref v) | Sup(ref v) => v
-                .iter()
-                .map(recurse)
-                .fold(Default::default(), SizeEstimate::add),
+            Container(ref v) | FragmentContainer(ref v) | Em(ref v) | Strong(ref v) | Strikeout(ref v) | Code(ref v)
+            | Block(ref v) | Dl(ref v) | Dt(ref v) | ListItem(ref v) | Sup(ref v) => {
+                split_and_calculate_max_size(v.iter(), recurse)
+            }
+            Div(ref v) => {
+                let mut size = v
+                    .iter()
+                    .map(recurse)
+                    .fold(Default::default(), SizeEstimate::max);
+                size
+            }
             Link(ref _target, ref v) => v
                 .iter()
                 .map(recurse)
-                .fold(Default::default(), SizeEstimate::add)
-                .add(SizeEstimate {
-                    size: 5,
-                    min_width: 5,
-                    prefix_size: 0,
-                }),
+                .fold(Default::default(), SizeEstimate::add),
+            // .add(SizeEstimate {
+            //     size: 5,
+            //     min_width: 5,
+            //     prefix_size: 0,
+            // }),
             Dd(ref v) | BlockQuote(ref v) | Ul(ref v) => {
                 let prefix = match self.info {
                     Dd(_) => "  ".into(),
@@ -693,7 +758,7 @@ impl RenderNode {
                 let mut size = v
                     .iter()
                     .map(recurse)
-                    .fold(Default::default(), SizeEstimate::add)
+                    .fold(Default::default(), SizeEstimate::max)
                     .add_hor(SizeEstimate {
                         size: prefix_width,
                         min_width: prefix_width,
@@ -707,7 +772,7 @@ impl RenderNode {
                 let mut result = v
                     .iter()
                     .map(recurse)
-                    .fold(Default::default(), SizeEstimate::add)
+                    .fold(Default::default(), SizeEstimate::max)
                     .add_hor(SizeEstimate {
                         size: prefix_size,
                         min_width: prefix_size,
@@ -731,13 +796,14 @@ impl RenderNode {
                 size
             }
             Break => SizeEstimate {
-                size: 1,
-                min_width: 1,
+                size: 0,
+                min_width: 0,
                 prefix_size: 0,
             },
             Table(ref t) => t.calc_size_estimate(context),
             TableRow(..) | TableBody(_) | TableCell(_) => unimplemented!(),
             FragStart(_) => Default::default(),
+            Form => Default::default(),
         };
         self.size_estimate.set(Some(estimate));
         estimate
@@ -757,6 +823,7 @@ impl RenderNode {
             }
 
             Container(ref v)
+            | FragmentContainer(ref v)
             | Link(_, ref v)
             | Em(ref v)
             | Strong(ref v)
@@ -777,6 +844,7 @@ impl RenderNode {
             Table(ref _t) => false,
             TableRow(..) | TableBody(_) | TableCell(_) => false,
             FragStart(_) => true,
+            Form => false,
         }
     }
 
@@ -829,7 +897,7 @@ impl RenderNode {
 
         match &self.info {
             RenderNodeInfo::Text(s) => writeln!(f, "{:indent$}{s:?}", "")?,
-            RenderNodeInfo::Container(v) => {
+            RenderNodeInfo::Container(v) | RenderNodeInfo::FragmentContainer(v) => {
                 self.write_container("Container", &v, f, indent)?;
             }
             RenderNodeInfo::Link(targ, v) => {
@@ -919,6 +987,9 @@ impl RenderNode {
             RenderNodeInfo::Sup(v) => {
                 self.write_container("Sup", &v, f, indent)?;
             }
+            RenderNodeInfo::Form => {
+                writeln!(f, "{:indent$}Form", "", indent = indent)?;
+            }
         }
         Ok(())
     }
@@ -940,6 +1011,7 @@ fn precalc_size_estimate<'a, D: TextDecorator>(
         }
 
         Container(ref v)
+        | FragmentContainer(ref v)
         | Link(_, ref v)
         | Em(ref v)
         | Strong(ref v)
@@ -983,6 +1055,7 @@ fn precalc_size_estimate<'a, D: TextDecorator>(
             }
         }
         TableRow(..) | TableBody(_) | TableCell(_) => unimplemented!(),
+        Form => TreeMapResult::Nothing,
     }
 }
 
@@ -1039,8 +1112,10 @@ fn table_to_render_tree<'a, T: Write>(
 ) -> TreeMapResult<'a, HtmlContext, RenderInput, RenderNode> {
     pending(input, move |_, rowset| {
         let mut rows = vec![];
+        let mut num_cols = 0;
         for bodynode in rowset {
             if let RenderNodeInfo::TableBody(body) = bodynode.info {
+                num_cols = num_cols.max(body.iter().map(|r| r.num_cells()).max().unwrap_or(0));
                 rows.extend(body);
             } else {
                 html_trace!("Found in table: {:?}", bodynode.info);
@@ -1048,6 +1123,21 @@ fn table_to_render_tree<'a, T: Write>(
         }
         if rows.is_empty() {
             None
+        } else if num_cols == 1 {
+            // map(
+            //                     |node| RenderNode::new_styled(node.info, node.style),
+            //                 )
+            let cells = (
+                rows
+                    .into_iter()
+                    .flat_map(|row: RenderTableRow| row.cells.into_iter())
+                    .flat_map(|c| c.content.clone())
+                    .collect()
+            );
+            Some(RenderNode::new_styled(
+                RenderNodeInfo::Container(cells),
+                computed,
+            ))
         } else {
             Some(RenderNode::new_styled(
                 RenderNodeInfo::Table(RenderTable::new(rows)),
@@ -1293,6 +1383,7 @@ struct HtmlContext {
     raw: bool,
     draw_borders: bool,
     wrap_links: bool,
+    done: bool,
 }
 
 // Input to render tree conversion.
@@ -1408,11 +1499,11 @@ fn prepend_marker(prefix: RenderNode, mut orig: RenderNode) -> RenderNode {
         | ListItem(ref mut children)
         | Div(ref mut children)
         | BlockQuote(ref mut children)
-        | Container(ref mut children)
+        | FragmentContainer(ref mut children)
         | TableCell(RenderTableCell {
-            content: ref mut children,
-            ..
-        }) => {
+                        content: ref mut children,
+                        ..
+                    }) => {
             children.insert(0, prefix);
             // Now return orig, but we do that outside the match so
             // that we've given back the borrowed ref 'children'.
@@ -1440,13 +1531,68 @@ fn prepend_marker(prefix: RenderNode, mut orig: RenderNode) -> RenderNode {
         // For anything else, just make a new Container with the
         // prefix node and the original one.
         _ => {
-            let result = RenderNode::new(Container(vec![prefix, orig]));
+            if !check_container(&vec![prefix.clone(), orig.clone()]) {
+                return orig;
+            }
+            let result = RenderNode::new(FragmentContainer(vec![prefix, orig]));
             html_trace!("prepend_marker() -> {:?}", result);
             return result;
         }
     }
     html_trace!("prepend_marker() -> {:?}", &orig);
     orig
+}
+
+fn check_container(
+    children: &Vec<RenderNode>,
+) -> bool {
+    // Check if there is a form
+    return true;
+    for c in children {
+        match &c.info {
+            RenderNodeInfo::Form => {
+                break;
+            }
+            RenderNodeInfo::FragmentContainer(v) => {
+                if !check_container(v) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    let form_exist = children.iter().any(|c| {
+        if let RenderNodeInfo::Form = c.info {
+            true
+        } else {
+            false
+        }
+    });
+    return !form_exist;
+}
+
+fn split_alpha_chains(s: &&str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphabetic())
+        .flat_map(|word| {
+            let mut words = Vec::new();
+            let mut current_word = String::new();
+            let mut prev_is_lower = false;
+
+            for c in word.chars() {
+                if c.is_uppercase() && prev_is_lower {
+                    words.push(current_word.clone());
+                    current_word.clear();
+                }
+                current_word.extend(c.to_lowercase());
+                prev_is_lower = c.is_lowercase();
+            }
+
+            if !current_word.is_empty() {
+                words.push(current_word);
+            }
+
+            words
+        }).collect()
 }
 
 fn process_dom_node<T: Write>(
@@ -1457,6 +1603,9 @@ fn process_dom_node<T: Write>(
 ) -> Result<TreeMapResult<'static, HtmlContext, RenderInput, RenderNode>> {
     use RenderNodeInfo::*;
     use TreeMapResult::*;
+    if context.done {
+        return Ok(Nothing);
+    }
 
     Ok(match input.handle.clone().data {
         Document => pending(input, |_context, cs| Some(RenderNode::new(Container(cs)))),
@@ -1467,6 +1616,163 @@ fn process_dom_node<T: Write>(
             ..
         } => {
             let mut frag_from_name_attr = false;
+
+            let attrs_ = attrs.borrow();
+            // Check the first (and only the first) class attr class if it exists
+            // for a fragment name.
+            let class = attrs_
+                .iter()
+                .filter(|attr| &attr.name.local == "class" || &attr.name.local == "id" || &attr.name.local == "role") //  || (&attr.name.local).starts_with("data"))
+                .map(|attr| attr.value.as_ref())
+                .collect::<Vec<_>>();
+            // split the class attr into words (contiguous letter words, skipping numbers)
+            // and collect as a set
+            // eg: "class1 class2" -> {"class", "class"}
+
+            // Check if any of the class tokens start with "menu", "nav" or "footer"
+            let mut to_skip = !(name.expanded() == expanded_name!(html "body") || name.expanded() == expanded_name!(html "html")) &&
+                ((
+                    class.iter().flat_map(split_alpha_chains)
+                ).any(|class|
+                    class.starts_with("menu")
+                        || class.starts_with("nav")
+                        || class.starts_with("btn")
+                        || class.starts_with("button")
+                        || class.starts_with("related")
+                        || class == "pager"
+                        || class == "banner"
+                        || class == "sidebar"
+                        || class == "actions"
+                        || class == "cgu"
+                        || class == "tos"
+                        || class == "share"
+                        || class == "sharing"
+                        || class == "partage"
+                        || class == "to-top"
+                        || class == "viral"
+                        // https://www.lexpress.fr/societe/cote-de-popularite-fillon-chute-hamon-grimpe_1879405.html
+                        // || class == "header"
+                        || class == "bubble"
+
+                        || class == "syndication"
+                        || class == "embedded"
+                        || class == "embed"
+                        || class == "newsletter"
+                        || class == "cookie"
+                        || class == "cookies"
+                        || class == "tags"
+                        || class == "tags"
+                        || class == "tag-list"
+                        || class.starts_with("breadcrumb")
+                        || class == "popover"
+                        || class == "modal"
+                        || class == "sticky"
+                        || class == "fixed"
+                        || class == "modals"
+                        || class == "carousel"
+                        || class.starts_with("affiliat")
+                        // || class == "meta"
+                        || class == "widget"
+                        || class.ends_with("author")
+                        || class == "hidden"
+                        || class == "hide"
+                        || class.starts_with("byline")
+                        || class.contains("copyright")
+                        || class.contains("download")
+                        || class.starts_with("rating")
+                        || class.starts_with("widget")
+                        || class.starts_with("attachment")
+                        || class.starts_with("timestamp")
+                        || class == "user-info"
+                        || class == "user-profile"
+                        || class == "credits"
+                        || class == "noskim"
+                        || class == "logo"
+                        || class == "ad"
+                        || class == "advertising"
+                        || class == "next"
+                        || class == "stories"
+                        || class == "most-popular"
+                        || class == "mol-factobox"
+                        || class == "ZendeskForm"
+                        || class == "message-container"
+                        || class == "yin"
+                        || class == "zlylin"
+                        || class == "xg1"
+                        || class == "bmdh"
+                        || class == "viewport"
+                        || class == "slide"
+                        || class == "overlay"
+                        || class == "paid"
+                        || class == "toast"
+                        || class == "paidcontent"
+                        || class == "notloaded"
+                        || class == "obsfuscated"
+                        || class == "blurred"
+                        || class == "nocomments"
+                        || class == "reply"
+                        || class == "akismet"
+                        || class == "noprint"
+                        || class == "comments"
+                        || class == "commentaire"
+                ) || (
+                    class.iter().flat_map(|class| class.split_whitespace().map(str::to_owned)))
+                    .any(|class|
+                        class == "no-display" || class == "no-show"
+                            || class.starts_with("footer")
+                            || class == "mdl-layout__header"
+                            || class == "not-loaded"
+                            || class.starts_with("paginat")
+                            || class.starts_with("bread-crumb")
+                            || class.starts_with("skip")
+                            || class.starts_with("md-skip")
+                            || class.starts_with("foot")
+
+                            // Negative sample: https://pressroom.natixis.com/actualites/herve-loarer-nomme-responsable-de-la-direction-technologies-infogerance-des-systemes-dinformation-et-services-partages-6683-b09b6.html
+                            || class.starts_with("social")
+                            || class.starts_with("filters")
+                            || class == "dialog"
+
+                            || class == "indicateur-langue"
+                            || class.starts_with("wm-ipp")
+                            || class.starts_with("mw-gallery")
+                            || class == "mw-editsection"
+                            || class == "mw-references-wrap"
+                            || class == "mw-references-columns"
+                            || class == "references-small"
+                            || class == "reference"
+                            || class == "mw-jump-link"
+                            || class.starts_with("cite_ref-")
+                            || class == "hatnote"
+                            || class == "need_ref"
+                            || class == "need_ref_tag"
+                            || class.starts_with("bandeau-niveau-")
+                            || class.starts_with("bandeau-niveau-")
+                            || class.starts_with("bandeau-niveau-")
+                            || class == "bandeau-portail"
+                            || class == "printfooter"
+                            || class == "metadata"
+                    ));
+
+            match attrs_
+                .iter()
+                .filter(|attr| &attr.name.local == "style")
+                .map(|attr| attr.value.as_ref())
+                .next() {
+                Some(style) => {
+                    let style = style.to_lowercase();
+                    if style.contains("display: none") || style.contains("display:none") || style.contains("position:fixed") {
+                        to_skip = true;
+                    }
+                }
+                None => {}
+            }
+
+            // Check aria-hidden
+
+            if to_skip {
+                return Ok(Nothing);
+            }
 
             let RenderInput {
                 ref handle,
@@ -1491,22 +1797,44 @@ fn process_dom_node<T: Write>(
                 expanded_name!(html "html") | expanded_name!(html "body") => {
                     /* process children, but don't add anything */
                     pending(input, move |_, cs| {
+                        if !check_container(&cs) {
+                            return None;
+                        }
                         Some(RenderNode::new_styled(Container(cs), computed))
                     })
                 }
                 expanded_name!(html "link")
                 | expanded_name!(html "meta")
-                | expanded_name!(html "hr")
                 | expanded_name!(html "script")
                 | expanded_name!(html "style")
-                | expanded_name!(html "head") => {
+                | expanded_name!(html "head")
+                | expanded_name!(html "button")
+                // | expanded_name!(html "header") but some sites use it as a nav bar
+                | expanded_name!(html "nav")
+                | expanded_name!(html "aside")
+                | expanded_name!(html "iframe")
+                | expanded_name!(html "figure")  // for wi
+                | expanded_name!(html "noscript")
+                | expanded_name!(html "footer") => {
                     /* Ignore the head and its children */
                     Nothing
                 }
                 expanded_name!(html "span") => {
                     /* process children, but don't add anything */
                     pending_noempty(input, move |_, cs| {
+                        if !check_container(&cs) {
+                            return None;
+                        }
                         Some(RenderNode::new_styled(Container(cs), computed))
+                    })
+                }
+                expanded_name!(html "form") => {
+                    pending(input, move |_, cs| {
+                        // if !check_container(&cs) {
+                        //     return None;
+                        // }
+                        // Some(RenderNode::new_styled(Container(cs), computed))
+                        Some(RenderNode::new(Form))
                     })
                 }
                 expanded_name!(html "a") => {
@@ -1532,6 +1860,9 @@ fn process_dom_node<T: Write>(
                             })
                         } else {
                             Box::new(move |_, cs| {
+                                if !check_container(&cs) {
+                                    return Ok(None);
+                                }
                                 Ok(Some(RenderNode::new_styled(Container(cs), computed)))
                             })
                         },
@@ -1562,6 +1893,10 @@ fn process_dom_node<T: Write>(
                     for attr in borrowed.iter() {
                         if &attr.name.local == "alt" && !attr.value.is_empty() {
                             title = Some(&*attr.value);
+                            // If title starts with "{\displaystyle " and ends with "}", remove them
+                            if title.unwrap().starts_with("{\\displaystyle ") && title.unwrap().ends_with("}") {
+                                title = Some(&title.unwrap()[14..title.unwrap().len() - 1]);
+                            }
                         }
                         if &attr.name.local == "src" && !attr.value.is_empty() {
                             src = Some(&*attr.value);
@@ -1584,11 +1919,38 @@ fn process_dom_node<T: Write>(
                 | expanded_name!(html "h3")
                 | expanded_name!(html "h4") => {
                     let level: usize = name.local[1..].parse().unwrap();
+                    let header_text = input
+                        .handle
+                        .children
+                        .borrow()
+                        .iter()
+                        .filter_map(|child| {
+                            // println!("child: {:?}", child);
+                            if let markup5ever_rcdom::NodeData::Text { contents } = &child.data {
+                                Some(contents.borrow().to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    // for wikipedia
+                    // println!("header_text: {:?}", header_text);
+                    if level == 2 {
+                        match (header_text.trim()) {
+                            "Notes et références" | "Voir aussi" | "Annexes" | "Compléments" | "Références" | "Référence" | "Liens externes" | "Liens internes" | "Articles connexes" => {
+                                // println!("Skip from header_text: {:?}", header_text);
+                                context.done = true;
+                            }
+                            _ => {}
+                        }
+                    }
                     pending(input, move |_, cs| {
                         Some(RenderNode::new_styled(Header(level, cs), computed))
                     })
                 }
-                expanded_name!(html "p") => pending_noempty(input, move |_, cs| {
+                expanded_name!(html "p")
+                | expanded_name!(html "article") => pending_noempty(input, move |_, cs| {
                     Some(RenderNode::new_styled(Block(cs), computed))
                 }),
                 expanded_name!(html "li") => pending(input, move |_, cs| {
@@ -1597,7 +1959,11 @@ fn process_dom_node<T: Write>(
                 expanded_name!(html "sup") => pending(input, move |_, cs| {
                     Some(RenderNode::new_styled(Sup(cs), computed))
                 }),
-                expanded_name!(html "div") => pending_noempty(input, move |_, cs| {
+                expanded_name!(html "div")
+                | expanded_name!(html "caption") => pending_noempty(input, move |_, cs| {
+                    if !check_container(&cs) {
+                        return None;
+                    }
                     Some(RenderNode::new_styled(Div(cs), computed))
                 }),
                 expanded_name!(html "pre") => pending(input, move |_, cs| {
@@ -1612,6 +1978,7 @@ fn process_dom_node<T: Write>(
                     Some(RenderNode::new_styled(Block(cs), computed))
                 }),
                 expanded_name!(html "br") => Finished(RenderNode::new_styled(Break, computed)),
+                expanded_name!(html "hr") => Finished(RenderNode::new_styled(Break, computed)),
                 expanded_name!(html "table") => table_to_render_tree(input, computed, err_out),
                 expanded_name!(html "thead") | expanded_name!(html "tbody") => {
                     tbody_to_render_tree(input, computed, err_out)
@@ -1657,6 +2024,9 @@ fn process_dom_node<T: Write>(
                 _ => {
                     html_trace!("Unhandled element: {:?}\n", name.local);
                     pending_noempty(input, move |_, cs| {
+                        if !check_container(&cs) {
+                            return None;
+                        }
                         Some(RenderNode::new_styled(Container(cs), computed))
                     })
                 }
@@ -1699,6 +2069,13 @@ fn process_dom_node<T: Write>(
             }
         }
         markup5ever_rcdom::NodeData::Text { contents: ref tstr } => {
+            // Check template_content for forbidden text: "À lire aussi", "S'abonner", "Abonnez vous", "Abonne toi":
+            match String::from(&*tstr.borrow()).to_lowercase().as_str() {
+                "à lire aussi" | "a lire aussi" | "s'abonner" | "abonnez vous" | "abonne toi" | "en accès libre" | "en accès libre" => {
+                    return Ok(Nothing);
+                }
+                _ => {}
+            }
             Finished(RenderNode::new(Text((&*tstr.borrow()).into())))
         }
         _ => {
@@ -1739,10 +2116,10 @@ fn render_tree_to_string<T: Write, D: TextDecorator>(
 fn pending2<
     D: TextDecorator,
     F: FnOnce(
-            &mut TextRenderer<D>,
-            Vec<Option<SubRenderer<D>>>,
-        ) -> Result<Option<Option<SubRenderer<D>>>>
-        + 'static,
+        &mut TextRenderer<D>,
+        Vec<Option<SubRenderer<D>>>,
+    ) -> Result<Option<Option<SubRenderer<D>>>>
+    + 'static,
 >(
     children: Vec<RenderNode>,
     f: F,
@@ -1830,6 +2207,10 @@ fn do_render_node<T: Write, D: TextDecorator>(
             pushed_style.unwind(renderer);
             Ok(Some(None))
         }),
+        FragmentContainer(children) => pending2(children, |renderer, _| {
+            pushed_style.unwind(renderer);
+            Ok(Some(None))
+        }),
         Link(href, children) => {
             renderer.start_link(&href)?;
             pending2(children, move |renderer: &mut TextRenderer<D>, _| {
@@ -1884,19 +2265,25 @@ fn do_render_node<T: Write, D: TextDecorator>(
             })
         }
         Header(level, children) => {
+            // debug print lines:
+            // println!("-------------");
+            // for line in &renderer.lines {
+            // //     println!("{:?}", line);
+            // }
+            renderer.add_empty_line()?;
             let prefix = renderer.header_prefix(level);
             let prefix_size = size_estimate.prefix_size;
             debug_assert!(prefix.len() == prefix_size);
             let min_width = size_estimate.min_width;
             let inner_width = min_width.saturating_sub(prefix_size);
             let sub_builder =
-                renderer.new_sub_renderer(renderer.width_minus(prefix_size, inner_width)?)?;
+                renderer.new_cased_sub_renderer(renderer.width_minus(prefix_size, inner_width)?, if level <= 2 { Case::Upper } else { Case::Title })?;
             renderer.push(sub_builder);
             pending2(children, move |renderer: &mut TextRenderer<D>, _| {
                 let sub_builder = renderer.pop();
 
                 renderer.start_block()?;
-                renderer.append_subrender(sub_builder, repeat(&prefix[..]))?;
+                renderer.append_subrender(sub_builder, repeat(&prefix[..]), None)?;
                 renderer.end_block();
                 pushed_style.unwind(renderer);
                 Ok(Some(None))
@@ -1921,7 +2308,7 @@ fn do_render_node<T: Write, D: TextDecorator>(
                 let sub_builder = renderer.pop();
 
                 renderer.start_block()?;
-                renderer.append_subrender(sub_builder, repeat(&prefix[..]))?;
+                renderer.append_subrender(sub_builder, repeat(&prefix[..]), None)?;
                 renderer.end_block();
                 pushed_style.unwind(renderer);
                 Ok(Some(None))
@@ -1954,6 +2341,7 @@ fn do_render_node<T: Write, D: TextDecorator>(
                     renderer.append_subrender(
                         sub_builder,
                         once(&prefix[..]).chain(repeat(&indent[..])),
+                        None,
                     )?;
                     Ok(())
                 })),
@@ -1969,7 +2357,7 @@ fn do_render_node<T: Write, D: TextDecorator>(
             // Assumption: num_items can't overflow isize.
             let max_number = start + (num_items as i64) - 1;
             let prefix_width_min = renderer.ordered_item_prefix(min_number).len();
-            let prefix_width_max = renderer.ordered_item_prefix(max_number).len();
+            let prefix_width_max = 1; //renderer.ordered_item_prefix(max_number).len();
             let prefix_width = max(prefix_width_min, prefix_width_max);
             let prefixn = format!("{: <width$}", "", width = prefix_width);
             let i: Cell<_> = Cell::new(start);
@@ -1995,6 +2383,7 @@ fn do_render_node<T: Write, D: TextDecorator>(
                     renderer.append_subrender(
                         sub_builder,
                         once(prefix1.as_str()).chain(repeat(prefixn.as_str())),
+                        None,
                     )?;
                     i.set(i.get() + 1);
                     Ok(())
@@ -2029,7 +2418,7 @@ fn do_render_node<T: Write, D: TextDecorator>(
             renderer.push(sub_builder);
             pending2(children, |renderer: &mut TextRenderer<D>, _| {
                 let sub_builder = renderer.pop();
-                renderer.append_subrender(sub_builder, repeat("  "))?;
+                renderer.append_subrender(sub_builder, repeat("  "), None)?;
                 pushed_style.unwind(renderer);
                 Ok(Some(None))
             })
@@ -2052,36 +2441,21 @@ fn do_render_node<T: Write, D: TextDecorator>(
         Sup(children) => {
             // Special case for digit-only superscripts - use superscript
             // characters.
-            fn sup_digits(children: &[RenderNode]) -> Option<String> {
-                let [node] = children else {
-                    return None;
-                };
-                if let Text(s) = &node.info {
-                    if s.chars().all(|d| d.is_ascii_digit()) {
-                        // It's just a string of digits - replace by superscript characters.
-                        const SUPERSCRIPTS: [char; 10] =
-                            ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
-                        return Some(
-                            s.bytes()
-                                .map(|b| SUPERSCRIPTS[(b - b'0') as usize])
-                                .collect(),
-                        );
-                    }
-                }
-                None
-            }
-            if let Some(digitstr) = sup_digits(&children) {
-                renderer.add_inline_text(&digitstr)?;
+            let old_case: Case = renderer.case.clone();
+            renderer.case = Case::Sup;
+            // renderer.start_superscript()?;
+            pending2(children, move |renderer: &mut TextRenderer<D>, _| {
+                renderer.case = old_case;
+
+                // renderer.end_superscript()?;
                 pushed_style.unwind(renderer);
-                Finished(None)
-            } else {
-                renderer.start_superscript()?;
-                pending2(children, |renderer: &mut TextRenderer<D>, _| {
-                    renderer.end_superscript()?;
-                    pushed_style.unwind(renderer);
-                    Ok(Some(None))
-                })
-            }
+                Ok(Some(None))
+            })
+        }
+        Form => {
+            // Don't render the form
+            pushed_style.unwind(renderer);
+            Finished(None)
         }
     })
 }
@@ -2093,6 +2467,7 @@ fn render_table_tree<T: Write, D: TextDecorator>(
 ) -> render::Result<TreeMapResult<'static, TextRenderer<D>, RenderNode, Option<SubRenderer<D>>>> {
     /* Now lay out the table. */
     let num_columns = table.num_columns;
+    let mut sub_renderer = renderer.new_sub_renderer(renderer.width())?;
 
     /* Heuristic: scale the column widths according to how much content there is. */
     let mut col_sizes: Vec<SizeEstimate> = vec![Default::default(); num_columns];
@@ -2105,10 +2480,18 @@ fn render_table_tree<T: Write, D: TextDecorator>(
 
             // If the cell has a colspan>1, then spread its size between the
             // columns.
-            estimate.size /= cell.colspan;
-            estimate.min_width /= cell.colspan;
+            // estimate.size /= cell.colspan;
+            // estimate.min_width /= cell.colspan;
             for i in 0..cell.colspan {
-                col_sizes[colno + i] = (col_sizes[colno + i]).max(estimate);
+                // let border = if (colnum + colno > 0) { 1 } else { 0 };
+                col_sizes[colno + i].size = max(
+                    col_sizes[colno + i].size,
+                    estimate.size / cell.colspan, // + border,
+                );
+                col_sizes[colno + i].min_width = max(
+                    col_sizes[colno + i].min_width,
+                    estimate.min_width / cell.colspan, // + border,
+                );
             }
             colno += cell.colspan;
         }
@@ -2117,9 +2500,9 @@ fn render_table_tree<T: Write, D: TextDecorator>(
     let tot_size: usize = col_sizes.iter().map(|est| est.size).sum();
     let min_size: usize = col_sizes.iter().map(|est| est.min_width).sum::<usize>()
         + col_sizes.len().saturating_sub(1);
-    let width = renderer.width();
+    let width = sub_renderer.width();
 
-    let vert_row = renderer.options.raw || (min_size > width || width == 0);
+    let vert_row = sub_renderer.options.raw || (min_size > width || width == 0);
 
     let mut col_widths: Vec<usize> = if !vert_row {
         col_sizes
@@ -2149,7 +2532,7 @@ fn render_table_tree<T: Write, D: TextDecorator>(
         let num_cols = col_widths.len();
         if num_cols > 0 {
             loop {
-                let cur_width = col_widths.iter().sum::<usize>() + num_cols - 1;
+                let cur_width = col_widths.iter().sum::<usize>(); // + num_cols - 1;
                 if cur_width <= width {
                     break;
                 }
@@ -2174,21 +2557,42 @@ fn render_table_tree<T: Write, D: TextDecorator>(
     } else {
         col_widths.iter().cloned().sum::<usize>()
             + col_widths
-                .iter()
-                .filter(|&w| w > &0)
-                .count()
-                .saturating_sub(1)
+            .iter()
+            .filter(|&w| w > &0)
+            .count()
+            .saturating_sub(1)
     };
 
-    renderer.start_block()?;
-
-    if table_width != 0 && renderer.options.draw_borders {
-        renderer.add_horizontal_border_width(table_width)?;
+    if table_width != 0 && sub_renderer.options.draw_borders {
+        // sub_renderer.add_horizontal_border_width(table_width)?;
     }
 
+    renderer.push(sub_renderer);
     Ok(TreeMapResult::PendingChildren {
         children: table.into_rows(col_widths, vert_row),
-        cons: Box::new(|_, _| Ok(Some(None))),
+        cons: Box::new(move |renderer: &mut TextRenderer<D>, _| {
+            let mut sub_renderer = renderer.pop();
+            sub_renderer.new_line_hard()?;
+            // iterate over sub renderer chars
+            renderer.append_subrender(
+                sub_renderer,
+                repeat(""),
+                Some(|strings: &Vec<String>| {
+                    let mut total_digits = 1;
+                    let mut total_non_punct = 1;
+                    strings.iter().map(|s| s.chars())
+                        .flatten()
+                        .for_each(|c| match c {
+                            '0'..='9' => total_digits += 1,
+                            'a'..='z' | 'A'..='Z' => total_non_punct += 1,
+                            _ => (),
+                        });
+                    // println!("Total digits: {} / Total non punct {}", total_digits, total_non_punct);
+                    (total_non_punct as f64 / total_digits as f64) > 4.0
+                }),
+            )?;
+            Ok(Some(None))
+        }),
         prefn: None,
         postfn: None,
     })
@@ -2315,6 +2719,7 @@ pub mod config {
                 raw: self.raw,
                 draw_borders: self.draw_borders,
                 wrap_links: self.wrap_links,
+                done: false,
             }
         }
         /// Parse with context.
@@ -2349,7 +2754,7 @@ pub mod config {
                     &mut io::sink(),
                     &mut self.make_context(),
                 )?
-                .ok_or(Error::Fail)?,
+                    .ok_or(Error::Fail)?,
             ))
         }
 

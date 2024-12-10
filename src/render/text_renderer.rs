@@ -327,6 +327,7 @@ struct WrappedBlock<T> {
     pre_wrapped: bool, // If true, we've been forced to wrap a <pre> line.
     pad_blocks: bool,
     allow_overflow: bool,
+    last_case: Case,
 }
 
 impl<T: Clone + Eq + Debug + Default> WrappedBlock<T> {
@@ -343,6 +344,7 @@ impl<T: Clone + Eq + Debug + Default> WrappedBlock<T> {
             pre_wrapped: false,
             pad_blocks,
             allow_overflow,
+            last_case: Case::Base,
         }
     }
 
@@ -538,6 +540,7 @@ impl<T: Clone + Eq + Debug + Default> WrappedBlock<T> {
         ws_mode: WhiteSpace,
         main_tag: &T,
         wrap_tag: &T,
+        case: Case,
     ) -> Result<()> {
         html_trace!("WrappedBlock::add_text({}), {:?}", text, main_tag);
         // We walk character by character.
@@ -634,7 +637,53 @@ impl<T: Clone + Eq + Debug + Default> WrappedBlock<T> {
                         self.pre_wrapped = true;
                         tag = wrap_tag;
                     }
-                    self.word.push_char(c, tag);
+                    if (case != self.last_case) && self.wordlen > 1 {
+                        if (case == Case::Sup) {
+                            self.word.push_char('^', tag);
+                        }
+                    }
+                    if case == Case::Title {
+                        if self.wordlen == 1 {
+                            self.word.push_char(c.to_uppercase().next().unwrap(), tag);
+                        } else {
+                            self.word.push_char(c, tag);
+                        }
+                    } else {
+                        match case {
+                            Case::Title => unreachable!(),
+                            Case::Upper => self.word.push_char(c.to_uppercase().next().unwrap(), tag),
+                            Case::Base | Case::Sup => self.word.push_char(c, tag),
+                            /* Case::Sup => {
+                                // Define a mapping for supported superscript characters
+                                const SUPERSCRIPTS: &[(char, char)] = &[
+                                    ('0', '⁰'), ('1', '¹'), ('2', '²'), ('3', '³'), ('4', '⁴'),
+                                    ('5', '⁵'), ('6', '⁶'), ('7', '⁷'), ('8', '⁸'), ('9', '⁹'),
+                                    ('a', 'ᵃ'), ('b', 'ᵇ'), ('c', 'ᶜ'), ('d', 'ᵈ'), ('e', 'ᵉ'),
+                                    ('f', 'ᶠ'), ('g', 'ᵍ'), ('h', 'ʰ'), ('i', 'ⁱ'), ('j', 'ʲ'),
+                                    ('k', 'ᵏ'), ('l', 'ˡ'), ('m', 'ᵐ'), ('n', 'ⁿ'), ('o', 'ᵒ'),
+                                    ('p', 'ᵖ'), ('r', 'ʳ'), ('s', 'ˢ'), ('t', 'ᵗ'), ('u', 'ᵘ'),
+                                    ('v', 'ᵛ'), ('w', 'ʷ'), ('x', 'ˣ'), ('y', 'ʸ'), ('z', 'ᶻ'),
+                                    ('A', 'ᴬ'), ('B', 'ᴮ'), ('D', 'ᴰ'), ('E', 'ᴱ'), ('G', 'ᴳ'),
+                                    ('H', 'ᴴ'), ('I', 'ᴵ'), ('J', 'ᴶ'), ('K', 'ᴷ'), ('L', 'ᴸ'),
+                                    ('M', 'ᴹ'), ('N', 'ᴺ'), ('O', 'ᴼ'), ('P', 'ᴾ'), ('R', 'ᴿ'),
+                                    ('T', 'ᵀ'), ('U', 'ᵁ'), ('V', 'ⱽ'), ('W', 'ᵂ'), (',', ' '),
+                                    ('.', '˙'), ('+', '⁺'), ('-', '⁻'), ('=', '⁼'), ('(', '⁽'),
+                                    (')', '⁾'), ('a', 'ᵃ'), ('b', 'ᵇ'), ('c', 'ᶜ'), ('d', 'ᵈ'),
+                                    ('e', 'ᵉ'), ('f', 'ᶠ'), ('g', 'ᵍ'), ('h', 'ʰ'), ('i', 'ⁱ'),
+                                    ('j', 'ʲ'), ('k', 'ᵏ'), ('l', 'ˡ'), ('m', 'ᵐ'), ('n', 'ⁿ'),
+                                    ('o', 'ᵒ'), ('p', 'ᵖ'), ('q', 'ᵠ'), ('r', 'ʳ'), ('s', 'ˢ'),
+                                    ('t', 'ᵗ'), ('u', 'ᵘ'), ('v', 'ᵛ'), ('w', 'ʷ'), ('x', 'ˣ'),
+                                    ('y', 'ʸ'), ('z', 'ᶻ'), ('[', '⁽'), (']', '⁾')
+                                ];
+                                let c = SUPERSCRIPTS
+                                    .iter()
+                                    .find_map(|(base, sup)| if *base == c { Some(*sup) } else { None })
+                                    .unwrap_or(c);
+                                self.word.push_char(c, tag);
+                            }*/
+                        }
+                    }
+                    self.last_case = case;
                 }
             }
         }
@@ -751,12 +800,12 @@ pub trait TextDecorator {
 
     /// Return an annotation and rendering prefix for superscript text
     fn decorate_superscript_start(&self) -> (String, Self::Annotation) {
-        ("^{".into(), Default::default())
+        ("^".into(), Default::default())
     }
 
     /// Return a suffix for after a superscript.
     fn decorate_superscript_end(&self) -> String {
-        "}".into()
+        "".into()
     }
 
     /// Finish with a document, and return extra lines (eg footnotes)
@@ -873,7 +922,7 @@ impl<T: Clone> BorderHoriz<T> {
             .iter()
             .map(|seg| match *seg {
                 Straight | JoinBelow | StraightVert => ' ',
-                JoinAbove | JoinCross => '│',
+                JoinAbove | JoinCross => '|',
             })
             .collect()
     }
@@ -884,11 +933,11 @@ impl<T: Clone> BorderHoriz<T> {
         self.segments
             .iter()
             .map(|seg| match seg {
-                BorderSegHoriz::Straight => '─',
+                BorderSegHoriz::Straight => '-',
                 BorderSegHoriz::StraightVert => '/',
-                BorderSegHoriz::JoinAbove => '┴',
-                BorderSegHoriz::JoinBelow => '┬',
-                BorderSegHoriz::JoinCross => '┼',
+                BorderSegHoriz::JoinAbove => '+',
+                BorderSegHoriz::JoinBelow => '+',
+                BorderSegHoriz::JoinCross => '+',
             })
             .collect::<String>()
     }
@@ -942,6 +991,19 @@ impl<T: PartialEq + Eq + Clone + Debug + Default> RenderLine<T> {
     }
 }
 
+/// Option to render the text with a special case
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Case {
+    /// Base case, don't change anything
+    Base,
+    /// Upper
+    Upper,
+    /// Title
+    Title,
+    /// Superscript
+    Sup,
+}
+
 /// A renderer which just outputs plain text with
 /// annotations depending on a decorator.
 #[derive(Clone)]
@@ -950,10 +1012,11 @@ pub(crate) struct SubRenderer<D: TextDecorator> {
     width: usize,
     /// Rendering options
     pub options: RenderOptions,
-    lines: LinkedList<RenderLine<Vec<D::Annotation>>>,
+    pub lines: LinkedList<RenderLine<Vec<D::Annotation>>>,
     /// True at the end of a block, meaning we should add
     /// a blank line if any other text is added.
     at_block_end: bool,
+    pub case: Case,
     wrapping: Option<WrappedBlock<Vec<D::Annotation>>>,
     decorator: D,
     ann_stack: Vec<D::Annotation>,
@@ -1051,6 +1114,7 @@ impl<D: TextDecorator> SubRenderer<D> {
             options,
             lines: LinkedList::new(),
             at_block_end: false,
+            case: Case::Base,
             wrapping: None,
             decorator,
             ann_stack: Vec::new(),
@@ -1196,6 +1260,13 @@ impl<D: TextDecorator> Renderer for SubRenderer<D> {
         Ok(())
     }
 
+    fn maybe_add_empty_line(&mut self) -> Result<()> {
+        if self.lines.iter().any(|l| l.has_content()) {
+            self.add_empty_line()?;
+        }
+        Ok(())
+    }
+
     fn new_sub_renderer(&self, width: usize) -> Result<Self> {
         let mut result = SubRenderer::new(
             width,
@@ -1207,12 +1278,25 @@ impl<D: TextDecorator> Renderer for SubRenderer<D> {
         Ok(result)
     }
 
+    fn new_cased_sub_renderer(&self, width: usize, case: Case) -> Result<Self> {
+        let mut result = SubRenderer::new(
+            width,
+            self.options.clone(),
+            self.decorator.make_subblock_decorator(),
+        );
+        // Copy the annotation stack
+        result.ann_stack = self.ann_stack.clone();
+        // Case
+        result.case = case;
+        Ok(result)
+    }
+
     fn start_block(&mut self) -> Result<()> {
         html_trace!("start_block({})", self.width);
         self.flush_all()?;
-        if self.lines.iter().any(|l| l.has_content()) {
-            self.add_empty_line()?;
-        }
+        // if self.lines.iter().any(|l| l.has_content()) {
+        //     self.add_empty_line()?;
+        // }
         html_trace_quiet!("start_block; at_block_end <- false");
         self.at_block_end = false;
         Ok(())
@@ -1313,7 +1397,7 @@ impl<D: TextDecorator> Renderer for SubRenderer<D> {
             main_tag = &self.ann_stack;
             cont_tag = &self.ann_stack;
         }
-        wrapping.add_text(filtered_text, ws_mode, main_tag, cont_tag)?;
+        wrapping.add_text(filtered_text, ws_mode, main_tag, cont_tag, self.case)?;
         Ok(())
     }
 
@@ -1321,7 +1405,12 @@ impl<D: TextDecorator> Renderer for SubRenderer<D> {
         self.width
     }
 
-    fn append_subrender<'a, I>(&mut self, other: Self, prefixes: I) -> Result<()>
+    fn append_subrender<'a, I>(
+        &mut self,
+        other: Self,
+        prefixes: I,
+        condition_fn: Option<fn(&Vec<String>) -> bool>,
+    ) -> Result<()>
     where
         I: Iterator<Item = &'a str>,
     {
@@ -1329,35 +1418,43 @@ impl<D: TextDecorator> Renderer for SubRenderer<D> {
 
         self.flush_wrapping()?;
         let tag = self.ann_stack.clone();
-        self.lines.extend(
-            other
-                .into_lines()?
-                .into_iter()
-                .zip(prefixes)
-                .map(|(line, prefix)| match line {
-                    RenderLine::Text(mut tline) => {
-                        if !prefix.is_empty() {
-                            tline.insert_front(TaggedString {
-                                s: prefix.to_string(),
-                                tag: tag.clone(),
-                            });
-                        }
-                        RenderLine::Text(tline)
-                    }
-                    RenderLine::Line(l) => {
-                        let mut tline = TaggedLine::new();
-                        tline.push(Str(TaggedString {
+        let other_lines = other
+            .into_lines()?
+            .into_iter()
+            .zip(prefixes)
+            .map(|(line, prefix)| match line {
+                RenderLine::Text(mut tline) => {
+                    if !prefix.is_empty() {
+                        tline.insert_front(TaggedString {
                             s: prefix.to_string(),
                             tag: tag.clone(),
-                        }));
-                        tline.push(Str(TaggedString {
-                            s: l.to_string(),
-                            tag: tag.clone(),
-                        }));
-                        RenderLine::Text(tline)
+                        });
                     }
-                }),
-        );
+                    RenderLine::Text(tline)
+                }
+                RenderLine::Line(l) => {
+                    let mut tline = TaggedLine::new();
+                    tline.push(Str(TaggedString {
+                        s: prefix.to_string(),
+                        tag: tag.clone(),
+                    }));
+                    tline.push(Str(TaggedString {
+                        s: l.to_string(),
+                        tag: tag.clone(),
+                    }));
+                    RenderLine::Text(tline)
+                }
+            });
+
+        if let Some(condition_fn) = condition_fn {
+            let collected = other_lines.collect::<Vec<RenderLine<_>>>();
+            let strings = collected.iter().map(|l| l.to_string()).collect::<Vec<String>>();
+            if condition_fn(&strings) {
+                self.lines.extend(collected.into_iter());
+            }
+            return Ok(());
+        }
+        self.lines.extend(other_lines);
         Ok(())
     }
 
@@ -1488,7 +1585,7 @@ impl<D: TextDecorator> Renderer for SubRenderer<D> {
                 if cellno != last_cellno {
                     line.push_char(
                         if self.options.draw_borders {
-                            '│'
+                            '|'
                         } else {
                             ' '
                         },
@@ -1500,7 +1597,7 @@ impl<D: TextDecorator> Renderer for SubRenderer<D> {
             line = TaggedLine::new();
         }
         if self.options.draw_borders {
-            self.lines.push_back(RenderLine::Line(next_border));
+            // self.lines.push_back(RenderLine::Line(next_border));
         }
         Ok(())
     }
@@ -1529,7 +1626,7 @@ impl<D: TextDecorator> Renderer for SubRenderer<D> {
                 );
                 self.add_horizontal_line(border)?;
             }
-            self.append_subrender(col, std::iter::repeat(""))?;
+            self.append_subrender(col, std::iter::repeat(""), None)?;
         }
         if self.options.draw_borders {
             self.add_horizontal_border()?;
